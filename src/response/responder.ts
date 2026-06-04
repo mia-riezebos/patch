@@ -18,7 +18,10 @@ import type { ConversationMessage } from "../conversation/types.js";
 import type { DiscordAdapter } from "../discord/adapter.js";
 import { stripUnicodeEmoji } from "../discord/no-emoji.js";
 import type { PronounProvider } from "../discord/pronouns.js";
-import { splitDiscordResponse } from "../discord/split.js";
+import {
+  needsSplitHintRepair,
+  splitDiscordResponse,
+} from "../discord/split.js";
 import type { LlmClient, LlmMessage, LlmResponse } from "../llm/client.js";
 import type { Logger } from "../logger.js";
 import {
@@ -117,13 +120,20 @@ export async function respond(options: RespondOptions): Promise<void> {
     const timeout = setTimeout(() => controller.abort(), config.llmTimeoutMs);
 
     try {
-      const { content, response } = await generateResponse({
+      const generated = await generateResponse({
         llm,
         promptMessages,
         signal: controller.signal,
         enableThinking: config.llmEnableThinking,
         thinkingMaxTokens: config.llmThinkingMaxTokens,
         thinkingTimeoutMs: config.llmThinkingTimeoutMs,
+      });
+      const { response } = generated;
+      const content = await repairMissingSplitHints({
+        llm,
+        content: generated.content,
+        signal: controller.signal,
+        log,
       });
 
       if (config.llmTraceLogging) {
@@ -165,6 +175,49 @@ export async function respond(options: RespondOptions): Promise<void> {
   } finally {
     typing.stop();
   }
+}
+
+async function repairMissingSplitHints(options: {
+  llm: LlmClient;
+  content: string;
+  signal: AbortSignal;
+  log: Logger;
+}): Promise<string> {
+  if (!needsSplitHintRepair(options.content)) return options.content;
+
+  options.log.debug(
+    { contentLength: options.content.length },
+    "repairing missing split hints",
+  );
+
+  const response = await options.llm.complete({
+    messages: [
+      {
+        role: "system",
+        content:
+          "Repair Discord output formatting only. Preserve the exact words, order, casing, and punctuation. Replace casual message-separating line breaks or blank lines with literal <split />. If the text is a poem, list, quote, code, or structured markdown, return it unchanged. Output only the repaired text.",
+      },
+      { role: "user", content: options.content },
+    ],
+    temperature: 0,
+    maxTokens: 768,
+    enableThinking: false,
+    signal: options.signal,
+  });
+
+  const repaired = stripUnicodeEmoji(response.content.trim());
+  if (!repaired) return options.content;
+
+  options.log.debug(
+    {
+      repaired: repaired !== options.content,
+      stillNeedsRepair: needsSplitHintRepair(repaired),
+      finishReason: response.finishReason,
+      timings: response.timings,
+    },
+    "split hint repair complete",
+  );
+  return repaired;
 }
 
 function withClassifierDecisionBlock(

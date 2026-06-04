@@ -1,11 +1,31 @@
 import { describe, expect, it } from "vitest";
-import { splitDiscordResponse } from "./split.js";
+import { needsSplitHintRepair, splitDiscordResponse } from "./split.js";
 
 describe("splitDiscordResponse", () => {
   it("preserves unstructured line breaks without explicit split hints", () => {
     expect(splitDiscordResponse("first\nsecond\n\nthird")).toEqual([
       "first\nsecond\n\nthird",
     ]);
+  });
+
+  it("detects casual multiline replies that need explicit split repair", () => {
+    expect(needsSplitHintRepair("first\nsecond\n\nthird")).toBe(true);
+  });
+
+  it("does not request split repair for structured markdown", () => {
+    expect(needsSplitHintRepair("- first\n- second")).toBe(false);
+  });
+
+  it("does not request split repair for long lines", () => {
+    expect(needsSplitHintRepair(`${"x".repeat(181)}\nshort`)).toBe(false);
+  });
+
+  it("does not request split repair for many lines", () => {
+    expect(needsSplitHintRepair("one\ntwo\nthree\nfour\nfive")).toBe(false);
+  });
+
+  it("requests split repair for short four-line casual bursts", () => {
+    expect(needsSplitHintRepair("one\ntwo\nthree\nfour")).toBe(true);
   });
 
   it("preserves heading-structured markdown", () => {

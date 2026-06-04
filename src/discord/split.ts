@@ -3,6 +3,27 @@ const SAFE_MESSAGE_LIMIT = 1900;
 const SPLIT_HINT = "<split />";
 const SPLIT_HINT_PATTERN = /<split\s*\/?>/gi;
 const MAX_RESPONSE_MESSAGES = 6;
+const MAX_SPLIT_REPAIR_LINES = 4;
+const MAX_SPLIT_REPAIR_LINE_CHARS = 180;
+
+export function needsSplitHintRepair(content: string): boolean {
+  const trimmed = content.trim();
+  if (!trimmed) return false;
+  if (/<split\s*\/?>/i.test(trimmed)) return false;
+  if (hasProtectedMarkdown(trimmed)) return false;
+
+  const nonEmptyLines = trimmed
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (nonEmptyLines.length < 2) return false;
+  if (nonEmptyLines.length > MAX_SPLIT_REPAIR_LINES) return false;
+  if (nonEmptyLines.some((line) => line.length > MAX_SPLIT_REPAIR_LINE_CHARS)) {
+    return false;
+  }
+
+  return /\n\s*\n/.test(trimmed) || nonEmptyLines.length > 1;
+}
 
 export function splitDiscordResponse(content: string): string[] {
   const normalized = normalizeSplitHints(content.trim());
