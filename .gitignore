@@ -36,5 +36,5 @@ pnpm-debug.log*
 .obsidian/
 
 # local scratch / agent worktrees
-Scratchpad.md
+Scratchpad*.md
 .worktrees/
