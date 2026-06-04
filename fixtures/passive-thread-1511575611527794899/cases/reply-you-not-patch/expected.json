@@ -1,0 +1,6 @@
+{
+  "slug": "reply-you-not-patch",
+  "messageId": "1511812688412676301",
+  "expected": false,
+  "note": "Reply context points `you` at the replied-to human/message, not Patch."
+}

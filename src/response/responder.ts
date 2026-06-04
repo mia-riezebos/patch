@@ -1,0 +1,414 @@
+import type { Message } from "discord.js";
+import type { ClassifierDecision } from "../classifier/response-classifier.js";
+import type { Config } from "../config.js";
+import {
+  reconstructConversationContext,
+  summarizeContext,
+  trimConversationContext,
+} from "../conversation/context.js";
+import {
+  escapeAttribute,
+  escapeTranscriptText,
+} from "../conversation/escape.js";
+import {
+  buildTranscript,
+  formatTranscript,
+} from "../conversation/transcript.js";
+import type { ConversationMessage } from "../conversation/types.js";
+import type { DiscordAdapter } from "../discord/adapter.js";
+import { stripUnicodeEmoji } from "../discord/no-emoji.js";
+import type { PronounProvider } from "../discord/pronouns.js";
+import { splitDiscordResponse } from "../discord/split.js";
+import type { LlmClient, LlmMessage, LlmResponse } from "../llm/client.js";
+import type { Logger } from "../logger.js";
+import {
+  type ResponseTranscriptMode,
+  buildResponseMessages,
+} from "../prompts/response.js";
+
+const FAILURE_MESSAGE =
+  "sorry, brain fog. couldn't get my thoughts into a usable shape. try that again?";
+const TYPING_WORDS_PER_MINUTE = 180;
+const AVERAGE_WORD_CHARS = 5;
+const MIN_FOLLOWUP_TYPING_DELAY_MS = 150;
+const MAX_FOLLOWUP_TYPING_DELAY_MS = 12_000;
+
+export type RespondOptions = {
+  adapter: DiscordAdapter;
+  message: Message;
+  botUserId: string;
+  config: Config;
+  llm: LlmClient;
+  logger: Logger;
+  pronounProvider?: PronounProvider | undefined;
+  contextMessages?: ConversationMessage[] | undefined;
+  classifierDecision?: ClassifierDecision | undefined;
+  silentFailure?: boolean | undefined;
+};
+
+export async function respond(options: RespondOptions): Promise<void> {
+  const {
+    adapter,
+    message,
+    botUserId,
+    config,
+    llm,
+    logger,
+    pronounProvider,
+    contextMessages,
+    classifierDecision,
+    silentFailure,
+  } = options;
+  const log = logger.child({
+    messageId: message.id,
+    channelId: message.channelId,
+  });
+  const typing = keepTyping(adapter, message.channelId, log);
+
+  try {
+    log.debug(
+      { silentFailure: Boolean(silentFailure) },
+      "response generation started",
+    );
+    const chain =
+      contextMessages ??
+      trimConversationContext(
+        await reconstructConversationContext(
+          adapter,
+          message,
+          botUserId,
+          log,
+          pronounProvider,
+          {
+            dmContextMessageLimit: config.dmContextMessageLimit,
+            threadContextMessageLimit: config.threadContextMessageLimit,
+            guildRecentMessageLimit: config.guildRecentMessageLimit,
+          },
+        ),
+        { contextTokens: config.llmContextTokens },
+      );
+    const transcript = buildTranscript(chain, botUserId);
+    const transcriptText = withClassifierDecisionBlock(
+      formatTranscript(transcript),
+      classifierDecision,
+    );
+
+    if (config.debugLogging) {
+      log.debug({ transcript: transcriptText }, "built transcript");
+    }
+
+    const promptMessages = buildResponseMessages(
+      transcriptText,
+      getResponseTranscriptMode(message),
+    );
+
+    if (config.llmTraceLogging) {
+      log.debug(
+        {
+          context: summarizeContext(chain),
+          transcript: transcriptText,
+          promptMessages,
+        },
+        "llm prompt trace",
+      );
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), config.llmTimeoutMs);
+
+    try {
+      const { content, response } = await generateResponse({
+        llm,
+        promptMessages,
+        signal: controller.signal,
+        enableThinking: config.llmEnableThinking,
+        thinkingMaxTokens: config.llmThinkingMaxTokens,
+        thinkingTimeoutMs: config.llmThinkingTimeoutMs,
+      });
+
+      if (config.llmTraceLogging) {
+        log.debug(
+          { rawResponse: response.raw, sanitizedContent: content },
+          "llm response trace",
+        );
+      } else {
+        log.debug(
+          { finishReason: response.finishReason, timings: response.timings },
+          "llm response complete",
+        );
+      }
+
+      await sendChunks(
+        adapter,
+        message,
+        content,
+        [...transcript.participantUserIds],
+        log,
+      );
+    } finally {
+      clearTimeout(timeout);
+    }
+  } catch (error) {
+    log.error({ error }, "failed to generate response");
+    if (silentFailure) return;
+
+    const failure = message.inGuild()
+      ? message.reply({
+          content: FAILURE_MESSAGE,
+          allowedMentions: { parse: [], repliedUser: false },
+        })
+      : adapter.sendMessage(message.channelId, FAILURE_MESSAGE);
+
+    await failure.catch((replyError) => {
+      log.error({ error: replyError }, "failed to send failure response");
+    });
+  } finally {
+    typing.stop();
+  }
+}
+
+function withClassifierDecisionBlock(
+  transcript: string,
+  decision: ClassifierDecision | undefined,
+): string {
+  if (!decision) return transcript;
+
+  const block = `<classifier_decision should_respond="${String(decision.shouldRespond)}" confidence="${escapeAttribute(String(decision.confidence))}">\n${escapeTranscriptText(decision.reason)}\n</classifier_decision>`;
+  const participantBlockEnd = "</participants>";
+  const participantBlockIndex = transcript.indexOf(participantBlockEnd);
+  if (participantBlockIndex === -1) return `${block}\n\n${transcript}`;
+
+  const insertAt = participantBlockIndex + participantBlockEnd.length;
+  return `${transcript.slice(0, insertAt)}\n\n${block}${transcript.slice(insertAt)}`;
+}
+
+async function generateResponse(options: {
+  llm: LlmClient;
+  promptMessages: LlmMessage[];
+  signal: AbortSignal;
+  enableThinking: boolean;
+  thinkingMaxTokens: number;
+  thinkingTimeoutMs: number;
+}): Promise<{ content: string; response: LlmResponse }> {
+  return completeAndSanitize(options.llm, {
+    messages: options.promptMessages,
+    signal: options.signal,
+    enableThinking: options.enableThinking,
+    thinkingMaxTokens: options.thinkingMaxTokens,
+    thinkingTimeoutMs: options.thinkingTimeoutMs,
+  });
+}
+
+async function completeAndSanitize(
+  llm: LlmClient,
+  request: {
+    messages: LlmMessage[];
+    signal: AbortSignal;
+    enableThinking?: boolean;
+    thinkingMaxTokens: number;
+    thinkingTimeoutMs: number;
+  },
+): Promise<{ content: string; response: LlmResponse }> {
+  if (!request.enableThinking) {
+    return completeAndRequireContent(llm, request);
+  }
+
+  const thinkingSignal = withTimeoutSignal(
+    request.signal,
+    request.thinkingTimeoutMs,
+  );
+
+  try {
+    const response = await llm.complete({
+      ...request,
+      maxTokens: request.thinkingMaxTokens,
+      signal: thinkingSignal.signal,
+    });
+    const content = stripUnicodeEmoji(response.content.trim());
+    if (content) return { content, response };
+
+    throw new Error(
+      `thinking response returned empty content; finishReason=${response.finishReason ?? "unknown"}; reasoningContentLength=${response.reasoningContent?.length ?? 0}`,
+    );
+  } catch (error) {
+    if (request.signal.aborted) throw error;
+    const reason = isAbortError(error) ? "timeout" : "empty_or_failed";
+    // Fall back to a no-thinking request so Discord typing does not hang on long reasoning.
+    const retry = await llm.complete({ ...request, enableThinking: false });
+    const retryContent = stripUnicodeEmoji(retry.content.trim());
+    if (retryContent) return { content: retryContent, response: retry };
+
+    throw new Error(
+      `thinking attempt failed (${reason}) and no-thinking retry returned empty content; finishReason=${retry.finishReason ?? "unknown"}; reasoningContentLength=${retry.reasoningContent?.length ?? 0}`,
+    );
+  } finally {
+    thinkingSignal.cleanup();
+  }
+}
+
+async function completeAndRequireContent(
+  llm: LlmClient,
+  request: {
+    messages: LlmMessage[];
+    signal: AbortSignal;
+    enableThinking?: boolean;
+  },
+): Promise<{ content: string; response: LlmResponse }> {
+  const response = await llm.complete(request);
+  const content = stripUnicodeEmoji(response.content.trim());
+  if (content) return { content, response };
+
+  throw new Error(
+    `LLM returned empty content; finishReason=${response.finishReason ?? "unknown"}; reasoningContentLength=${response.reasoningContent?.length ?? 0}`,
+  );
+}
+
+function withTimeoutSignal(parent: AbortSignal, timeoutMs: number) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const abort = () => controller.abort();
+  parent.addEventListener("abort", abort, { once: true });
+
+  return {
+    signal: controller.signal,
+    cleanup() {
+      clearTimeout(timeout);
+      parent.removeEventListener("abort", abort);
+    },
+  };
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
+async function sendChunks(
+  adapter: DiscordAdapter,
+  trigger: Message,
+  content: string,
+  participantUserIds: string[],
+  log: Logger,
+): Promise<void> {
+  const chunks = splitDiscordResponse(content);
+  log.debug(
+    {
+      chunkCount: chunks.length,
+      allowedMentionUserCount: participantUserIds.length,
+    },
+    "sending Discord response chunks",
+  );
+
+  if (!trigger.inGuild()) {
+    for (const [index, chunk] of chunks.entries()) {
+      if (index > 0) {
+        await waitForFollowupTyping(adapter, trigger.channelId, chunk, log);
+      }
+      log.debug(
+        { index, chunkLength: chunk.length },
+        "sending Discord message chunk",
+      );
+      await adapter.sendMessage(trigger.channelId, chunk, {
+        allowedMentionUsers: participantUserIds,
+      });
+      log.debug({ index }, "sent Discord message chunk");
+    }
+    return;
+  }
+
+  const [first, ...rest] = chunks;
+  if (!first) {
+    log.warn("no Discord response chunks to send");
+    return;
+  }
+
+  log.debug(
+    { index: 0, chunkLength: first.length },
+    "sending Discord reply chunk",
+  );
+  await adapter.sendReply(
+    { channelId: trigger.channelId, messageId: trigger.id },
+    first,
+    { allowedMentionUsers: participantUserIds },
+  );
+  log.debug({ index: 0 }, "sent Discord reply chunk");
+
+  for (const [offset, chunk] of rest.entries()) {
+    const index = offset + 1;
+    await waitForFollowupTyping(adapter, trigger.channelId, chunk, log);
+    log.debug(
+      { index, chunkLength: chunk.length },
+      "sending Discord message chunk",
+    );
+    await adapter.sendMessage(trigger.channelId, chunk, {
+      allowedMentionUsers: participantUserIds,
+    });
+    log.debug({ index }, "sent Discord message chunk");
+  }
+}
+
+async function waitForFollowupTyping(
+  adapter: DiscordAdapter,
+  channelId: string,
+  chunk: string,
+  log: Logger,
+): Promise<void> {
+  const delayMs = followupTypingDelayMs(chunk);
+  log.debug(
+    { channelId, chunkLength: chunk.length, delayMs },
+    "waiting before follow-up chunk",
+  );
+  await adapter
+    .sendTyping(channelId)
+    .catch((error) =>
+      log.warn({ error, channelId }, "failed to send typing indicator"),
+    );
+  await sleep(delayMs);
+}
+
+function followupTypingDelayMs(chunk: string): number {
+  const rawDelay =
+    (chunk.length * 60_000) / (TYPING_WORDS_PER_MINUTE * AVERAGE_WORD_CHARS);
+  return clamp(
+    Math.round(rawDelay),
+    MIN_FOLLOWUP_TYPING_DELAY_MS,
+    MAX_FOLLOWUP_TYPING_DELAY_MS,
+  );
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getResponseTranscriptMode(message: Message): ResponseTranscriptMode {
+  if (!message.inGuild()) return "dm";
+  if (message.channel.isThread()) return "thread";
+  return "global";
+}
+
+function keepTyping(adapter: DiscordAdapter, channelId: string, log: Logger) {
+  let stopped = false;
+
+  const send = () => {
+    adapter
+      .sendTyping(channelId)
+      .catch((error) =>
+        log.warn({ error, channelId }, "failed to send typing indicator"),
+      );
+  };
+
+  send();
+  const interval = setInterval(() => {
+    if (!stopped) send();
+  }, 8_000);
+
+  return {
+    stop() {
+      stopped = true;
+      clearInterval(interval);
+    },
+  };
+}

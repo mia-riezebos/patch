@@ -1,0 +1,6 @@
+{
+  "slug": "role-mention-not-patch",
+  "messageId": "1511812750521925754",
+  "expected": false,
+  "note": "Role mention plus question; not a Patch mention/user author mention."
+}

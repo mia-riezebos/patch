@@ -1,0 +1,6 @@
+{
+  "slug": "direct-name-no-mention",
+  "messageId": "1511812596616003716",
+  "expected": true,
+  "note": "Directly addresses Patch by name without mention."
+}

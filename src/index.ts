@@ -1,0 +1,480 @@
+import "dotenv/config";
+import {
+  Client,
+  Events,
+  type Message,
+  type PartialMessage,
+  type ThreadChannel,
+} from "discord.js";
+import { classifyShouldRespond } from "./classifier/response-classifier.js";
+import { loadConfig } from "./config.js";
+import {
+  limitContextMessages,
+  reconstructConversationContext,
+  trimConversationContext,
+} from "./conversation/context.js";
+import type { ConversationMessage } from "./conversation/types.js";
+import { startActivityLoop } from "./discord/activity.js";
+import {
+  DELETE_COMMAND_NAME,
+  LEAVE_COMMAND_NAME,
+  MODEL_COMMAND_NAME,
+  RELOAD_COMMAND_NAME,
+  handleDeleteCommand,
+  handleModelAutocomplete,
+  handleModelCommand,
+  handleReloadCommand,
+  registerCommands,
+} from "./discord/commands.js";
+import {
+  DiscordJsAdapter,
+  discordClientOptions,
+} from "./discord/discord-js-adapter.js";
+import { handleLeaveCommand } from "./discord/leave.js";
+import { DiscordPronounProvider } from "./discord/pronouns.js";
+import { getBotIdentity } from "./identity.js";
+import { LlmClient } from "./llm/client.js";
+import { ModelCatalog } from "./llm/model-catalog.js";
+import { createLogger } from "./logger.js";
+import { GenerationQueue } from "./queue.js";
+import { respond } from "./response/responder.js";
+import { SettingsStore } from "./settings/store.js";
+
+const MENTION_CACHE_LIMIT = 5_000;
+
+const mentionStateByMessageId = new Map<string, boolean>();
+const config = loadConfig();
+const identity = getBotIdentity();
+const logger = createLogger(config.debugLogging || config.llmTraceLogging);
+const client = new Client(discordClientOptions);
+const settings = new SettingsStore(config.settingsDbPath, {
+  llmModel: config.llmModel,
+});
+const llm = new LlmClient(config, settings);
+const modelCatalog = new ModelCatalog(llm, logger);
+const pronounProvider = new DiscordPronounProvider(
+  config.discordToken,
+  logger,
+  config.pronounOverrides,
+);
+const queue = new GenerationQueue(config.maxGlobalConcurrency);
+
+client.once(Events.ClientReady, (readyClient) => {
+  startActivityLoop({ client: readyClient, config, llm, logger, queue });
+
+  void modelCatalog.refresh().catch((error) => {
+    logger.warn({ error }, "failed to prewarm model catalog");
+  });
+
+  void registerCommands(readyClient, logger).catch((error) => {
+    logger.error({ error }, "failed to register slash commands");
+  });
+
+  logger.info(
+    {
+      botUserId: readyClient.user.id,
+      username: readyClient.user.username,
+      identityName: identity.name,
+      llmModel: settings.getLlmModel(),
+      settingsDbPath: config.settingsDbPath,
+    },
+    `${identity.name.toLowerCase()} online`,
+  );
+});
+
+client.on(Events.MessageCreate, (message) => {
+  void handleMessage(message).catch((error) => {
+    logger.error(
+      { error, messageId: message.id, channelId: message.channelId },
+      "unhandled message handler failure",
+    );
+  });
+});
+
+client.on(Events.MessageUpdate, (oldMessage, newMessage) => {
+  void handleMessageUpdate(oldMessage, newMessage).catch((error) => {
+    logger.error(
+      { error, messageId: newMessage.id, channelId: newMessage.channelId },
+      "unhandled message update handler failure",
+    );
+  });
+});
+
+client.on(Events.InteractionCreate, (interaction) => {
+  if (interaction.isAutocomplete()) {
+    if (interaction.commandName === MODEL_COMMAND_NAME) {
+      void handleModelAutocomplete(interaction, {
+        config,
+        logger,
+        modelCatalog,
+        settings,
+      }).catch((error) => {
+        logger.error(
+          {
+            error,
+            interactionId: interaction.id,
+            channelId: interaction.channelId,
+          },
+          "unhandled model autocomplete failure",
+        );
+      });
+    }
+    return;
+  }
+
+  if (!interaction.isChatInputCommand()) return;
+
+  if (interaction.commandName === DELETE_COMMAND_NAME) {
+    void handleDeleteCommand(interaction, { client, config, logger }).catch(
+      (error) => {
+        logger.error(
+          {
+            error,
+            interactionId: interaction.id,
+            channelId: interaction.channelId,
+          },
+          "unhandled delete command failure",
+        );
+      },
+    );
+    return;
+  }
+
+  if (interaction.commandName === MODEL_COMMAND_NAME) {
+    void handleModelCommand(interaction, { config, logger, settings }).catch(
+      (error) => {
+        logger.error(
+          {
+            error,
+            interactionId: interaction.id,
+            channelId: interaction.channelId,
+          },
+          "unhandled model command failure",
+        );
+      },
+    );
+    return;
+  }
+
+  if (interaction.commandName === LEAVE_COMMAND_NAME) {
+    void handleLeaveCommand(interaction, {
+      client,
+      config,
+      llm,
+      logger,
+      queue,
+    }).catch((error) => {
+      logger.error(
+        {
+          error,
+          interactionId: interaction.id,
+          channelId: interaction.channelId,
+        },
+        "unhandled leave command failure",
+      );
+    });
+    return;
+  }
+
+  if (interaction.commandName === RELOAD_COMMAND_NAME) {
+    void handleReloadCommand(interaction, { config, logger }).catch((error) => {
+      logger.error(
+        {
+          error,
+          interactionId: interaction.id,
+          channelId: interaction.channelId,
+        },
+        "unhandled reload command failure",
+      );
+    });
+  }
+});
+
+await client.login(config.discordToken);
+
+async function handleMessage(message: Message): Promise<void> {
+  const botUserId = client.user?.id;
+  if (!botUserId) return;
+  if (message.author.bot) return;
+
+  const mentionsBotUser = message.mentions.users.has(botUserId);
+  rememberMentionState(message.id, mentionsBotUser);
+
+  const adapter = new DiscordJsAdapter(client, botUserId);
+  const isDm = !message.inGuild();
+  const repliesToBot = await isReplyToBot(adapter, message, botUserId);
+  const manualTrigger = isDm || mentionsBotUser || repliesToBot;
+
+  if (manualTrigger) {
+    const enqueuedAt = Date.now();
+    logger.debug(
+      { messageId: message.id, channelId: message.channelId },
+      "queueing manual response job",
+    );
+    await queue.add(
+      () => {
+        logger.debug(
+          {
+            messageId: message.id,
+            channelId: message.channelId,
+            queuedMs: Date.now() - enqueuedAt,
+          },
+          "manual response job started",
+        );
+        return respond({
+          adapter,
+          message,
+          botUserId,
+          config,
+          llm,
+          logger,
+          pronounProvider,
+        });
+      },
+      { priority: "manual", bucketKey: message.channelId },
+    );
+    return;
+  }
+
+  if (!(await shouldRunPassiveClassifier(message, botUserId))) return;
+
+  const enqueuedAt = Date.now();
+  logger.debug(
+    { messageId: message.id, channelId: message.channelId },
+    "queueing passive classifier job",
+  );
+  await queue.add(
+    async () => {
+      logger.debug(
+        {
+          messageId: message.id,
+          channelId: message.channelId,
+          queuedMs: Date.now() - enqueuedAt,
+        },
+        "passive classifier job started",
+      );
+      const contextMessages = await buildSharedContext(
+        adapter,
+        message,
+        botUserId,
+      );
+      const classifierContextMessages = limitContextMessages(
+        contextMessages,
+        config.classifierContextMessageLimit,
+      );
+      if (classifierContextMessages.length !== contextMessages.length) {
+        logger.debug(
+          {
+            messageId: message.id,
+            channelId: message.channelId,
+            contextMessageCount: contextMessages.length,
+            classifierContextMessageCount: classifierContextMessages.length,
+          },
+          "limited passive classifier context",
+        );
+      }
+      const decision = await classifyShouldRespond({
+        message,
+        botUserId,
+        llm,
+        logger,
+        llmTraceLogging: config.llmTraceLogging,
+        contextMessages: classifierContextMessages,
+      });
+      if (!decision.shouldRespond) {
+        logger.debug(
+          { messageId: message.id, channelId: message.channelId, decision },
+          "passive classifier declined response",
+        );
+        return;
+      }
+      logger.debug(
+        { messageId: message.id, channelId: message.channelId, decision },
+        "passive classifier accepted response",
+      );
+      await respond({
+        adapter,
+        message,
+        botUserId,
+        config,
+        llm,
+        logger,
+        pronounProvider,
+        contextMessages,
+        classifierDecision: decision,
+        silentFailure: true,
+      });
+    },
+    {
+      priority: "passive",
+      bucketKey: message.channelId,
+      ttlMs: config.passiveResponseTtlMs,
+    },
+  );
+}
+
+async function buildSharedContext(
+  adapter: DiscordJsAdapter,
+  message: Message,
+  botUserId: string,
+): Promise<ConversationMessage[]> {
+  return trimConversationContext(
+    await reconstructConversationContext(
+      adapter,
+      message,
+      botUserId,
+      logger,
+      pronounProvider,
+      {
+        dmContextMessageLimit: config.dmContextMessageLimit,
+        threadContextMessageLimit: config.threadContextMessageLimit,
+        guildRecentMessageLimit: config.guildRecentMessageLimit,
+      },
+    ),
+    { contextTokens: config.llmContextTokens },
+  );
+}
+
+async function shouldRunPassiveClassifier(
+  message: Message,
+  botUserId: string,
+): Promise<boolean> {
+  if (!config.responseClassifierEnabled) return false;
+  if (!message.channel.isThread()) return false;
+  return isThreadMember(message.channel as ThreadChannel, botUserId);
+}
+
+async function isThreadMember(
+  thread: ThreadChannel,
+  botUserId: string,
+): Promise<boolean> {
+  try {
+    await thread.members.fetch({ member: botUserId, force: true, cache: true });
+    return true;
+  } catch (error) {
+    if (discordErrorCode(error) === 10007) {
+      logger.debug(
+        { threadId: thread.id },
+        `skipping passive classifier because ${getBotIdentity().name} is not in thread`,
+      );
+      return false;
+    }
+
+    logger.warn(
+      { error, threadId: thread.id },
+      "failed to check thread membership; skipping passive classifier",
+    );
+    return false;
+  }
+}
+
+function discordErrorCode(error: unknown): number | undefined {
+  if (!error || typeof error !== "object" || !("code" in error)) {
+    return undefined;
+  }
+
+  const code = error.code;
+  return typeof code === "number" ? code : undefined;
+}
+
+async function handleMessageUpdate(
+  oldMessage: Message | PartialMessage,
+  newMessage: Message | PartialMessage,
+): Promise<void> {
+  const botUserId = client.user?.id;
+  if (!botUserId) return;
+
+  const beforeMentionedBot =
+    mentionStateByMessageId.get(oldMessage.id) ??
+    mentionsBot(oldMessage, botUserId);
+  const afterMentionedBot = mentionsBot(newMessage, botUserId);
+
+  if (afterMentionedBot !== undefined) {
+    rememberMentionState(newMessage.id, afterMentionedBot);
+  }
+
+  if (beforeMentionedBot !== false || afterMentionedBot !== true) return;
+
+  const message = await fetchUpdatedMessage(newMessage);
+  if (!message || message.author.bot) return;
+
+  const adapter = new DiscordJsAdapter(client, botUserId);
+  await queue.add(
+    () =>
+      respond({
+        adapter,
+        message,
+        botUserId,
+        config,
+        llm,
+        logger,
+        pronounProvider,
+      }),
+    { priority: "manual", bucketKey: message.channelId },
+  );
+}
+
+function rememberMentionState(
+  messageId: string,
+  mentionsBotUser: boolean,
+): void {
+  mentionStateByMessageId.set(messageId, mentionsBotUser);
+  if (mentionStateByMessageId.size <= MENTION_CACHE_LIMIT) return;
+
+  const oldest = mentionStateByMessageId.keys().next().value;
+  if (oldest) mentionStateByMessageId.delete(oldest);
+}
+
+function mentionsBot(
+  message: Message | PartialMessage,
+  botUserId: string,
+): boolean | undefined {
+  const mentionPattern = new RegExp(`<@!?${botUserId}>`);
+  if (typeof message.content === "string") {
+    return (
+      mentionPattern.test(message.content) ||
+      message.mentions.users.has(botUserId)
+    );
+  }
+
+  return undefined;
+}
+
+async function fetchUpdatedMessage(
+  message: Message | PartialMessage,
+): Promise<Message | undefined> {
+  if (!message.partial) return message;
+
+  try {
+    return await message.fetch();
+  } catch (error) {
+    logger.warn(
+      { error, messageId: message.id },
+      "failed to fetch edited message",
+    );
+    return undefined;
+  }
+}
+
+async function isReplyToBot(
+  adapter: DiscordJsAdapter,
+  message: Message,
+  botUserId: string,
+): Promise<boolean> {
+  const reference = message.reference;
+  if (!reference?.messageId || !reference.channelId) return false;
+
+  try {
+    const parent = await adapter.fetchMessage({
+      channelId: reference.channelId,
+      messageId: reference.messageId,
+    });
+    return parent.authorId === botUserId;
+  } catch (error) {
+    logger.warn(
+      { error, messageId: message.id, parentMessageId: reference.messageId },
+      "failed to inspect reply target",
+    );
+    return false;
+  }
+}

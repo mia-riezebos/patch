@@ -1,0 +1,6 @@
+{
+  "slug": "ambient-yes",
+  "messageId": "1511812893220278282",
+  "expected": false,
+  "note": "Ambient acknowledgement/reaction after Patch response."
+}

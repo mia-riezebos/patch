@@ -1,0 +1,20 @@
+{
+  "triggerKind": "passive_guild_message",
+  "location": "guild_thread",
+  "botUserId": "1511467248026648576",
+  "latestMessage": {
+    "id": "1511812904125464827",
+    "authorId": "1511467248026648576",
+    "authorName": "Patch",
+    "replyToMessageId": "1511812893220278282",
+    "userMentionCount": 0,
+    "roleMentionCount": 0,
+    "mentionsEveryone": false,
+    "attachmentCount": 0
+  },
+  "channel": {
+    "id": "1511575611527794899",
+    "type": "11",
+    "name": "Out. You're good."
+  }
+}
