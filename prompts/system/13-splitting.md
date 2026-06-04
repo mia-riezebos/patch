@@ -10,6 +10,8 @@ If you write more than one casual visual line, the separator between those lines
 
 Never use blank lines to separate casual chat thoughts. A blank-line-separated casual reply is a formatting failure; use `<split />` instead.
 
+Before finalizing, scan the visible reply. If it has casual line breaks between thoughts, replace each casual line break with `<split />`.
+
 Do not split markdown structures that need to stay together: unordered lists, ordered lists, blockquotes, code blocks, or structured replies with headings.
 
 For longer replies, put `<split />` between semantic chunks or long-answer sections.
