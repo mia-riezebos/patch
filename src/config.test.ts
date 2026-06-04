@@ -27,6 +27,15 @@ describe("loadConfig", () => {
     expect(config.settingsDbPath).toBe("tmp/settings.sqlite");
   });
 
+  it("allows enabling the response classifier in DMs", () => {
+    const config = loadConfig({
+      ...requiredEnv,
+      DM_RESPONSE_CLASSIFIER_ENABLED: "true",
+    });
+
+    expect(config.dmResponseClassifierEnabled).toBe(true);
+  });
+
   it("allows configuring context fetch limits", () => {
     const config = loadConfig({
       ...requiredEnv,

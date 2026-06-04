@@ -202,8 +202,10 @@ async function handleMessage(message: Message): Promise<void> {
 
   const adapter = new DiscordJsAdapter(client, botUserId);
   const isDm = !message.inGuild();
+  const classifyDm = isDm && config.dmResponseClassifierEnabled;
   const repliesToBot = await isReplyToBot(adapter, message, botUserId);
-  const manualTrigger = isDm || mentionsBotUser || repliesToBot;
+  const manualTrigger =
+    mentionsBotUser || (!classifyDm && (isDm || repliesToBot));
 
   if (manualTrigger) {
     const enqueuedAt = Date.now();
@@ -236,12 +238,12 @@ async function handleMessage(message: Message): Promise<void> {
     return;
   }
 
-  if (!(await shouldRunPassiveClassifier(message, botUserId))) return;
+  if (!(await shouldRunResponseClassifier(message, botUserId))) return;
 
   const enqueuedAt = Date.now();
   logger.debug(
     { messageId: message.id, channelId: message.channelId },
-    "queueing passive classifier job",
+    "queueing response classifier job",
   );
   await queue.add(
     async () => {
@@ -251,7 +253,7 @@ async function handleMessage(message: Message): Promise<void> {
           channelId: message.channelId,
           queuedMs: Date.now() - enqueuedAt,
         },
-        "passive classifier job started",
+        "response classifier job started",
       );
       const contextMessages = await buildSharedContext(
         adapter,
@@ -270,7 +272,7 @@ async function handleMessage(message: Message): Promise<void> {
             contextMessageCount: contextMessages.length,
             classifierContextMessageCount: classifierContextMessages.length,
           },
-          "limited passive classifier context",
+          "limited response classifier context",
         );
       }
       const decision = await classifyShouldRespond({
@@ -284,13 +286,13 @@ async function handleMessage(message: Message): Promise<void> {
       if (!decision.shouldRespond) {
         logger.debug(
           { messageId: message.id, channelId: message.channelId, decision },
-          "passive classifier declined response",
+          "response classifier declined response",
         );
         return;
       }
       logger.debug(
         { messageId: message.id, channelId: message.channelId, decision },
-        "passive classifier accepted response",
+        "response classifier accepted response",
       );
       await respond({
         adapter,
@@ -335,11 +337,12 @@ async function buildSharedContext(
   );
 }
 
-async function shouldRunPassiveClassifier(
+async function shouldRunResponseClassifier(
   message: Message,
   botUserId: string,
 ): Promise<boolean> {
   if (!config.responseClassifierEnabled) return false;
+  if (!message.inGuild()) return config.dmResponseClassifierEnabled;
   if (!message.channel.isThread()) return false;
   return isThreadMember(message.channel as ThreadChannel, botUserId);
 }

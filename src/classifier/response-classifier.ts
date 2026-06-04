@@ -121,7 +121,7 @@ function buildClassifierPromptContext(
   const replyToMessageId = message.reference?.messageId;
 
   return {
-    triggerKind: "passive_guild_message",
+    triggerKind: message.inGuild() ? "passive_guild_message" : "dm_message",
     location: classifyLocation(message),
     botUserId,
     latestMessage: {
@@ -145,6 +145,7 @@ function buildClassifierPromptContext(
 function classifyLocation(
   message: Message,
 ): ClassifierPromptContext["location"] {
+  if (!message.inGuild()) return "dm";
   return message.channel.isThread() ? "guild_thread" : "guild_channel";
 }
 

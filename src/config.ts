@@ -18,6 +18,7 @@ export type Config = {
   debugLogging: boolean;
   llmTraceLogging: boolean;
   responseClassifierEnabled: boolean;
+  dmResponseClassifierEnabled: boolean;
   pronounOverrides: ReadonlyMap<string, string>;
   activityUpdatesEnabled: boolean;
   activityUpdateIntervalMs: number;
@@ -54,6 +55,7 @@ const ConfigSchema = Schema.Struct({
   debugLogging: Schema.Boolean,
   llmTraceLogging: Schema.Boolean,
   responseClassifierEnabled: Schema.Boolean,
+  dmResponseClassifierEnabled: Schema.Boolean,
   pronounOverrides: Schema.ReadonlyMap(Schema.String, Schema.String),
   activityUpdatesEnabled: Schema.Boolean,
   activityUpdateIntervalMs: PositiveInteger,
@@ -92,6 +94,10 @@ export function loadConfigEffect(env: NodeJS.ProcessEnv = process.env) {
       llmTraceLogging: boolean(env.LLM_TRACE_LOGGING, false),
       responseClassifierEnabled: boolean(
         env.RESPONSE_CLASSIFIER_ENABLED,
+        false,
+      ),
+      dmResponseClassifierEnabled: boolean(
+        env.DM_RESPONSE_CLASSIFIER_ENABLED,
         false,
       ),
       pronounOverrides: parseKeyValueMap(env.DISCORD_PRONOUN_OVERRIDES),
