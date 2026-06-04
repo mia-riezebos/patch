@@ -96,7 +96,7 @@ Patch targets a local llama.cpp OpenAI-compatible server. Current default local 
 
 ```env
 LLM_BASE_URL=http://10.0.3.2:8080/v1
-LLM_MODEL=qwen3.5-9b
+LLM_MODEL=gemma-4-e4b-it
 LLM_API_KEY=local
 ```
 
@@ -119,7 +119,7 @@ Requests include llama.cpp-specific options:
 DISCORD_TOKEN=
 DISCORD_CLIENT_ID=
 LLM_BASE_URL=http://10.0.3.2:8080/v1
-LLM_MODEL=qwen3.5-9b
+LLM_MODEL=gemma-4-e4b-it
 LLM_API_KEY=local
 SETTINGS_DB_PATH=data/patch.sqlite
 LLM_CONTEXT_TOKENS=32768

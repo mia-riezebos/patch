@@ -79,7 +79,7 @@ export function loadConfigEffect(env: NodeJS.ProcessEnv = process.env) {
       llmBaseUrl: trimTrailingSlash(
         env.LLM_BASE_URL ?? "http://10.0.3.2:8080/v1",
       ),
-      llmModel: env.LLM_MODEL ?? "qwen3.5-9b",
+      llmModel: env.LLM_MODEL ?? "gemma-4-e4b-it",
       llmApiKey: env.LLM_API_KEY ?? "local",
       settingsDbPath: env.SETTINGS_DB_PATH ?? "data/patch.sqlite",
       llmContextTokens: integer(env.LLM_CONTEXT_TOKENS, 32_768),

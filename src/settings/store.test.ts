@@ -14,9 +14,9 @@ afterEach(() => {
 
 describe("SettingsStore", () => {
   it("seeds the LLM model from config", () => {
-    const store = new SettingsStore(":memory:", { llmModel: "qwen3.5-9b" });
+    const store = new SettingsStore(":memory:", { llmModel: "gemma-4-e4b-it" });
 
-    expect(store.getLlmModel()).toBe("qwen3.5-9b");
+    expect(store.getLlmModel()).toBe("gemma-4-e4b-it");
 
     store.close();
   });
@@ -26,11 +26,11 @@ describe("SettingsStore", () => {
     tempDirs.push(dir);
     const path = join(dir, "patch.sqlite");
 
-    const first = new SettingsStore(path, { llmModel: "qwen3.5-9b" });
+    const first = new SettingsStore(path, { llmModel: "gemma-4-e4b-it" });
     first.setLlmModel("gemma-4-e4b-it");
     first.close();
 
-    const second = new SettingsStore(path, { llmModel: "qwen3.5-9b" });
+    const second = new SettingsStore(path, { llmModel: "gemma-4-e4b-it" });
     expect(second.getLlmModel()).toBe("gemma-4-e4b-it");
     second.close();
   });
