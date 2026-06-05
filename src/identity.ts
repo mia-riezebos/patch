@@ -1,12 +1,19 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
+export type InterestValue = string | string[] | InterestRecord;
+export interface InterestRecord {
+  [key: string]: InterestValue;
+}
+export type InterestBank = string[] | InterestRecord;
+
 export type BotIdentity = {
   name: string;
   pronouns: string;
   aliases: string[];
   project: string;
   background: string;
+  interests: InterestBank;
   hobbies: string[];
 };
 
@@ -17,6 +24,25 @@ export const DEFAULT_BOT_IDENTITY: BotIdentity = {
   project: "Patch",
   background:
     "a cartoon bear plushie and the face of the Patch music/producer project",
+  interests: {
+    music: {
+      genres: [
+        "drum & bass",
+        "future garage",
+        "melodic electronic music",
+        "neoy2k nostalgia",
+      ],
+      artists: [],
+    },
+    art: {
+      styles: [],
+      artists: [],
+    },
+    media: {
+      genres: [],
+      actorsComedians: [],
+    },
+  },
   hobbies: [
     "drum & bass",
     "future garage",
@@ -52,6 +78,7 @@ export function renderIdentityTemplate(
     (match, key) => {
       const value = identity[key as keyof BotIdentity];
       if (Array.isArray(value)) return value.join(", ");
+      if (isInterestBank(value)) return formatInterestBank(value);
       if (typeof value === "string") return value;
       return match;
     },
@@ -82,6 +109,9 @@ function withEnvOverrides(
     project: env.BOT_PROJECT ?? identity.project,
     background: env.BOT_BACKGROUND ?? identity.background,
     hobbies: env.BOT_HOBBIES ? splitCsv(env.BOT_HOBBIES) : identity.hobbies,
+    interests: env.BOT_HOBBIES
+      ? interestsFromLegacyHobbies(splitCsv(env.BOT_HOBBIES))
+      : identity.interests,
   });
 }
 
@@ -93,13 +123,15 @@ function isIdentityInput(value: unknown): value is IdentityInput {
 
 function normalizeIdentity(input: IdentityInput): BotIdentity {
   const name = stringOr(input.name, DEFAULT_BOT_IDENTITY.name);
+  const interests = normalizeInterestBank(input.interests, input.hobbies);
   return {
     name,
     pronouns: stringOr(input.pronouns, DEFAULT_BOT_IDENTITY.pronouns),
     aliases: nonEmptyStrings(input.aliases, [name.toLowerCase()]),
     project: stringOr(input.project, name),
     background: stringOr(input.background, DEFAULT_BOT_IDENTITY.background),
-    hobbies: nonEmptyStrings(input.hobbies, DEFAULT_BOT_IDENTITY.hobbies),
+    interests,
+    hobbies: nonEmptyStrings(input.hobbies, flattenInterestBank(interests)),
   };
 }
 
@@ -121,4 +153,129 @@ function splitCsv(value: string): string[] {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function normalizeInterestBank(
+  value: unknown,
+  legacyHobbies: unknown,
+): InterestBank {
+  if (Array.isArray(value) || typeof value === "string") {
+    return nonEmptyStrings(value, DEFAULT_BOT_IDENTITY.hobbies);
+  }
+
+  if (!isRecord(value)) {
+    return Array.isArray(legacyHobbies) || typeof legacyHobbies === "string"
+      ? interestsFromLegacyHobbies(nonEmptyStrings(legacyHobbies, []))
+      : DEFAULT_BOT_IDENTITY.interests;
+  }
+
+  const normalized = normalizeInterestRecord(value);
+  return Object.keys(normalized).length
+    ? normalized
+    : DEFAULT_BOT_IDENTITY.interests;
+}
+
+function normalizeInterestRecord(
+  value: Record<string, unknown>,
+): InterestRecord {
+  return Object.fromEntries(
+    Object.entries(value).flatMap(([key, child]) => {
+      const normalized = normalizeInterestValue(child);
+      return normalized === undefined ? [] : [[key, normalized]];
+    }),
+  );
+}
+
+function normalizeInterestValue(value: unknown): InterestValue | undefined {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed ? trimmed : undefined;
+  }
+
+  if (Array.isArray(value)) {
+    const values = value.flatMap((item) =>
+      typeof item === "string" && item.trim() ? [item.trim()] : [],
+    );
+    return values.length ? values : undefined;
+  }
+
+  if (isRecord(value)) {
+    const values = normalizeInterestRecord(value);
+    return Object.keys(values).length ? values : undefined;
+  }
+
+  return undefined;
+}
+
+function interestsFromLegacyHobbies(hobbies: string[]): InterestBank {
+  return {
+    ...DEFAULT_BOT_IDENTITY.interests,
+    music: {
+      ...asInterestRecord(
+        Array.isArray(DEFAULT_BOT_IDENTITY.interests)
+          ? undefined
+          : DEFAULT_BOT_IDENTITY.interests.music,
+      ),
+      genres: hobbies,
+    },
+  };
+}
+
+function flattenInterestBank(interests: InterestBank): string[] {
+  if (Array.isArray(interests)) return interests;
+  return Object.values(interests).flatMap(flattenInterestValue);
+}
+
+function flattenInterestValue(value: InterestValue): string[] {
+  if (typeof value === "string") return [value];
+  if (Array.isArray(value)) return value;
+  return flattenInterestBank(value);
+}
+
+function formatInterestBank(interests: InterestBank): string {
+  if (Array.isArray(interests)) return interests.join(", ");
+  return formatInterestRecord(interests, []).join("; ");
+}
+
+function formatInterestRecord(
+  interests: InterestBank,
+  path: string[],
+): string[] {
+  return Object.entries(interests).flatMap(([key, value]) =>
+    formatInterestValue(value, [...path, key]),
+  );
+}
+
+function formatInterestValue(value: InterestValue, path: string[]): string[] {
+  if (typeof value === "string")
+    return [`${formatInterestPath(path)}: ${value}`];
+  if (Array.isArray(value)) {
+    return value.length
+      ? [`${formatInterestPath(path)}: ${value.join(", ")}`]
+      : [];
+  }
+  return formatInterestRecord(value, path);
+}
+
+function formatInterestPath(path: string[]): string {
+  return path.map(humanizeKey).join(" ");
+}
+
+function humanizeKey(value: string): string {
+  return value
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[_-]+/g, " ")
+    .toLowerCase();
+}
+
+function isInterestBank(value: unknown): value is InterestBank {
+  return Array.isArray(value) || isRecord(value);
+}
+
+function asInterestRecord(value: InterestValue | undefined): InterestRecord {
+  return isRecord(value) ? value : {};
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
