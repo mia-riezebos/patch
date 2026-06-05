@@ -6,11 +6,37 @@ export type LlmMessage = {
   content: string;
 };
 
+export type LlmTool = {
+  type: "function";
+  function: {
+    name: string;
+    description: string;
+    parameters: unknown;
+  };
+};
+
+export type LlmToolChoice =
+  | "auto"
+  | "none"
+  | {
+      type: "function";
+      function: { name: string };
+    };
+
+export type LlmToolCall = {
+  id?: string | undefined;
+  type: "function";
+  name: string;
+  arguments: string;
+};
+
 export type LlmRequest = {
   messages: LlmMessage[];
   temperature?: number;
   maxTokens?: number;
   enableThinking?: boolean;
+  tools?: readonly LlmTool[];
+  toolChoice?: LlmToolChoice;
   signal?: AbortSignal;
 };
 
@@ -18,6 +44,7 @@ export type LlmResponse = {
   content: string;
   reasoningContent?: string;
   finishReason?: string;
+  toolCalls?: LlmToolCall[];
   timings?: unknown;
   raw?: unknown;
 };
@@ -47,23 +74,27 @@ export class LlmClient {
   }
 
   async complete(request: LlmRequest): Promise<LlmResponse> {
+    const body: LlamaChatCompletionRequest = {
+      model: this.settings?.getLlmModel() ?? this.config.llmModel,
+      messages: request.messages,
+      chat_template_kwargs: {
+        enable_thinking:
+          request.enableThinking ?? this.config.llmEnableThinking,
+      },
+      cache_prompt: true,
+      temperature: request.temperature ?? this.config.llmTemperature,
+      max_tokens: request.maxTokens ?? this.config.llmMaxTokens,
+    };
+    if (request.tools) body.tools = [...request.tools];
+    if (request.toolChoice) body.tool_choice = request.toolChoice;
+
     const requestInit: RequestInit = {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${this.config.llmApiKey}`,
       },
-      body: JSON.stringify({
-        model: this.settings?.getLlmModel() ?? this.config.llmModel,
-        messages: request.messages,
-        chat_template_kwargs: {
-          enable_thinking:
-            request.enableThinking ?? this.config.llmEnableThinking,
-        },
-        cache_prompt: true,
-        temperature: request.temperature ?? this.config.llmTemperature,
-        max_tokens: request.maxTokens ?? this.config.llmMaxTokens,
-      }),
+      body: JSON.stringify(body),
     };
     if (request.signal) requestInit.signal = request.signal;
 
@@ -87,6 +118,8 @@ export class LlmClient {
     if (choice?.message?.reasoning_content)
       result.reasoningContent = choice.message.reasoning_content;
     if (choice?.finish_reason) result.finishReason = choice.finish_reason;
+    const toolCalls = parseToolCalls(choice?.message?.tool_calls);
+    if (toolCalls.length > 0) result.toolCalls = toolCalls;
     if (json.timings) result.timings = json.timings;
     result.raw = json;
     return result;
@@ -97,6 +130,17 @@ type OpenAiModelsResponse = {
   data: Array<{ id?: string }>;
 };
 
+type LlamaChatCompletionRequest = {
+  model: string;
+  messages: LlmMessage[];
+  chat_template_kwargs: { enable_thinking: boolean };
+  cache_prompt: boolean;
+  temperature: number;
+  max_tokens: number;
+  tools?: LlmTool[] | undefined;
+  tool_choice?: LlmToolChoice | undefined;
+};
+
 type LlamaChatCompletionResponse = {
   choices?: Array<{
     finish_reason?: string;
@@ -104,7 +148,33 @@ type LlamaChatCompletionResponse = {
       role?: string;
       content?: string;
       reasoning_content?: string;
+      tool_calls?: unknown;
     };
   }>;
   timings?: unknown;
 };
+
+function parseToolCalls(toolCalls: unknown): LlmToolCall[] {
+  if (!Array.isArray(toolCalls)) return [];
+
+  return toolCalls.flatMap((toolCall) => {
+    if (!toolCall || typeof toolCall !== "object") return [];
+    const input = toolCall as {
+      id?: unknown;
+      type?: unknown;
+      function?: { name?: unknown; arguments?: unknown };
+    };
+    if (input.type !== "function") return [];
+    const name = input.function?.name;
+    const args = input.function?.arguments;
+    if (typeof name !== "string") return [];
+
+    const parsed: LlmToolCall = {
+      type: "function",
+      name,
+      arguments: typeof args === "string" ? args : "{}",
+    };
+    if (typeof input.id === "string") parsed.id = input.id;
+    return [parsed];
+  });
+}
