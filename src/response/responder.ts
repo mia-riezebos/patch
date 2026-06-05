@@ -1,4 +1,10 @@
 import type { Message } from "discord.js";
+import {
+  buildModelVisibleActions,
+  formatAvailableActionsPrompt,
+} from "../actions/action-context.js";
+import type { ActionContext } from "../actions/context.js";
+import type { ActionRegistry } from "../actions/registry.js";
 import type { ClassifierDecision } from "../classifier/response-classifier.js";
 import type { Config } from "../config.js";
 import {
@@ -47,6 +53,8 @@ export type RespondOptions = {
   contextMessages?: ConversationMessage[] | undefined;
   classifierDecision?: ClassifierDecision | undefined;
   silentFailure?: boolean | undefined;
+  actionContext?: ActionContext | undefined;
+  actionRegistry?: ActionRegistry | undefined;
 };
 
 export async function respond(options: RespondOptions): Promise<void> {
@@ -61,6 +69,8 @@ export async function respond(options: RespondOptions): Promise<void> {
     contextMessages,
     classifierDecision,
     silentFailure,
+    actionContext,
+    actionRegistry,
   } = options;
   const log = logger.child({
     messageId: message.id,
@@ -100,9 +110,17 @@ export async function respond(options: RespondOptions): Promise<void> {
       log.debug({ transcript: transcriptText }, "built transcript");
     }
 
+    const availableActions = buildAvailableActions({
+      message,
+      actionContext,
+      actionRegistry,
+    });
+    const availableActionsPrompt =
+      formatAvailableActionsPrompt(availableActions);
     const promptMessages = buildResponseMessages(
       transcriptText,
       getResponseTranscriptMode(message),
+      availableActionsPrompt,
     );
 
     if (config.llmTraceLogging) {
@@ -110,6 +128,7 @@ export async function respond(options: RespondOptions): Promise<void> {
         {
           context: summarizeContext(chain),
           transcript: transcriptText,
+          availableActions,
           promptMessages,
         },
         "llm prompt trace",
@@ -175,6 +194,22 @@ export async function respond(options: RespondOptions): Promise<void> {
   } finally {
     typing.stop();
   }
+}
+
+function buildAvailableActions(options: {
+  message: Message;
+  actionContext?: ActionContext | undefined;
+  actionRegistry?: ActionRegistry | undefined;
+}) {
+  if (!options.actionContext || !options.actionRegistry) return [];
+
+  return buildModelVisibleActions({
+    triggerMessage: options.message,
+    channelId: options.message.channelId,
+    guildId: options.message.guildId ?? undefined,
+    context: options.actionContext,
+    registry: options.actionRegistry,
+  });
 }
 
 async function repairMissingSplitHints(options: {

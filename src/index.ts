@@ -6,6 +6,8 @@ import {
   type PartialMessage,
   type ThreadChannel,
 } from "discord.js";
+import { registerDefaultActions } from "./actions/defaults.js";
+import { actionRegistry } from "./actions/registry.js";
 import { classifyShouldRespond } from "./classifier/response-classifier.js";
 import { loadConfig } from "./config.js";
 import {
@@ -14,23 +16,13 @@ import {
   trimConversationContext,
 } from "./conversation/context.js";
 import type { ConversationMessage } from "./conversation/types.js";
+import { dispatchInteraction } from "./discord/actions/dispatch.js";
+import { registerDiscordActionTriggers } from "./discord/actions/register.js";
 import { startActivityLoop } from "./discord/activity.js";
-import {
-  DELETE_COMMAND_NAME,
-  LEAVE_COMMAND_NAME,
-  MODEL_COMMAND_NAME,
-  RELOAD_COMMAND_NAME,
-  handleDeleteCommand,
-  handleModelAutocomplete,
-  handleModelCommand,
-  handleReloadCommand,
-  registerCommands,
-} from "./discord/commands.js";
 import {
   DiscordJsAdapter,
   discordClientOptions,
 } from "./discord/discord-js-adapter.js";
-import { handleLeaveCommand } from "./discord/leave.js";
 import { DiscordPronounProvider } from "./discord/pronouns.js";
 import { getBotIdentity } from "./identity.js";
 import { LlmClient } from "./llm/client.js";
@@ -58,6 +50,17 @@ const pronounProvider = new DiscordPronounProvider(
   config.pronounOverrides,
 );
 const queue = new GenerationQueue(config.maxGlobalConcurrency);
+const actionContext = {
+  client,
+  config,
+  llm,
+  logger,
+  queue,
+  modelCatalog,
+  settings,
+};
+
+registerDefaultActions(actionRegistry);
 
 client.once(Events.ClientReady, (readyClient) => {
   startActivityLoop({ client: readyClient, config, llm, logger, queue });
@@ -66,8 +69,12 @@ client.once(Events.ClientReady, (readyClient) => {
     logger.warn({ error }, "failed to prewarm model catalog");
   });
 
-  void registerCommands(readyClient, logger).catch((error) => {
-    logger.error({ error }, "failed to register slash commands");
+  void registerDiscordActionTriggers({
+    client: readyClient,
+    registry: actionRegistry,
+    logger,
+  }).catch((error) => {
+    logger.error({ error }, "failed to register action triggers");
   });
 
   logger.info(
@@ -101,93 +108,21 @@ client.on(Events.MessageUpdate, (oldMessage, newMessage) => {
 });
 
 client.on(Events.InteractionCreate, (interaction) => {
-  if (interaction.isAutocomplete()) {
-    if (interaction.commandName === MODEL_COMMAND_NAME) {
-      void handleModelAutocomplete(interaction, {
-        config,
-        logger,
-        modelCatalog,
-        settings,
-      }).catch((error) => {
-        logger.error(
-          {
-            error,
-            interactionId: interaction.id,
-            channelId: interaction.channelId,
-          },
-          "unhandled model autocomplete failure",
-        );
-      });
-    }
-    return;
-  }
-
-  if (!interaction.isChatInputCommand()) return;
-
-  if (interaction.commandName === DELETE_COMMAND_NAME) {
-    void handleDeleteCommand(interaction, { client, config, logger }).catch(
-      (error) => {
-        logger.error(
-          {
-            error,
-            interactionId: interaction.id,
-            channelId: interaction.channelId,
-          },
-          "unhandled delete command failure",
-        );
+  void dispatchInteraction({
+    interaction,
+    context: actionContext,
+    registry: actionRegistry,
+  }).catch((error) => {
+    logger.error(
+      {
+        error,
+        interactionId: interaction.id,
+        channelId: interaction.channelId,
+        guildId: interaction.guildId,
       },
+      "unhandled interaction dispatch failure",
     );
-    return;
-  }
-
-  if (interaction.commandName === MODEL_COMMAND_NAME) {
-    void handleModelCommand(interaction, { config, logger, settings }).catch(
-      (error) => {
-        logger.error(
-          {
-            error,
-            interactionId: interaction.id,
-            channelId: interaction.channelId,
-          },
-          "unhandled model command failure",
-        );
-      },
-    );
-    return;
-  }
-
-  if (interaction.commandName === LEAVE_COMMAND_NAME) {
-    void handleLeaveCommand(interaction, {
-      client,
-      config,
-      llm,
-      logger,
-      queue,
-    }).catch((error) => {
-      logger.error(
-        {
-          error,
-          interactionId: interaction.id,
-          channelId: interaction.channelId,
-        },
-        "unhandled leave command failure",
-      );
-    });
-    return;
-  }
-
-  if (interaction.commandName === RELOAD_COMMAND_NAME) {
-    void handleReloadCommand(interaction, { config, logger }).catch((error) => {
-      logger.error(
-        {
-          error,
-          interactionId: interaction.id,
-          channelId: interaction.channelId,
-        },
-        "unhandled reload command failure",
-      );
-    });
-  }
+  });
 });
 
 await client.login(config.discordToken);
@@ -231,6 +166,8 @@ async function handleMessage(message: Message): Promise<void> {
           llm,
           logger,
           pronounProvider,
+          actionContext,
+          actionRegistry,
         });
       },
       { priority: "manual", bucketKey: message.channelId },
@@ -305,6 +242,8 @@ async function handleMessage(message: Message): Promise<void> {
         contextMessages,
         classifierDecision: decision,
         silentFailure: true,
+        actionContext,
+        actionRegistry,
       });
     },
     {
@@ -412,6 +351,8 @@ async function handleMessageUpdate(
         llm,
         logger,
         pronounProvider,
+        actionContext,
+        actionRegistry,
       }),
     { priority: "manual", bucketKey: message.channelId },
   );

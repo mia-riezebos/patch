@@ -15,13 +15,19 @@ const MODE_PROMPT_FILES: Record<ResponseTranscriptMode, string> = {
 export function buildResponseMessages(
   transcript: string,
   mode: ResponseTranscriptMode,
+  availableActionsPrompt = "",
 ) {
   const systemPromptFiles = [
     ...RESPONSE_TRANSCRIPT_PREFIX_PROMPT_FILES,
     MODE_PROMPT_FILES[mode],
     ...RESPONSE_TRANSCRIPT_SUFFIX_PROMPT_FILES,
   ];
-  const systemPrompt = systemPromptFiles.map(readPromptFile).join("\n\n");
+  const systemPrompt = [
+    systemPromptFiles.map(readPromptFile).join("\n\n"),
+    availableActionsPrompt,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 
   return [
     { role: "system" as const, content: systemPrompt },
