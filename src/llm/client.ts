@@ -85,7 +85,8 @@ export class LlmClient {
       temperature: request.temperature ?? this.config.llmTemperature,
       max_tokens: request.maxTokens ?? this.config.llmMaxTokens,
     };
-    if (request.tools) body.tools = [...request.tools];
+    if (request.tools && request.tools.length > 0)
+      body.tools = [...request.tools];
     if (request.toolChoice) body.tool_choice = request.toolChoice;
 
     const requestInit: RequestInit = {

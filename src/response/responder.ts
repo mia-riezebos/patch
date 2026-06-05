@@ -2,6 +2,7 @@ import type { Message } from "discord.js";
 import {
   buildModelVisibleActions,
   formatAvailableActionsPrompt,
+  toLlmTools,
 } from "../actions/action-context.js";
 import type { ActionContext } from "../actions/context.js";
 import type { ActionRegistry } from "../actions/registry.js";
@@ -28,7 +29,12 @@ import {
   needsSplitHintRepair,
   splitDiscordResponse,
 } from "../discord/split.js";
-import type { LlmClient, LlmMessage, LlmResponse } from "../llm/client.js";
+import type {
+  LlmClient,
+  LlmMessage,
+  LlmResponse,
+  LlmTool,
+} from "../llm/client.js";
 import type { Logger } from "../logger.js";
 import {
   type ResponseTranscriptMode,
@@ -117,6 +123,7 @@ export async function respond(options: RespondOptions): Promise<void> {
     });
     const availableActionsPrompt =
       formatAvailableActionsPrompt(availableActions);
+    const tools = toLlmTools(availableActions);
     const promptMessages = buildResponseMessages(
       transcriptText,
       getResponseTranscriptMode(message),
@@ -129,6 +136,7 @@ export async function respond(options: RespondOptions): Promise<void> {
           context: summarizeContext(chain),
           transcript: transcriptText,
           availableActions,
+          nativeTools: tools.map((tool) => tool.function.name),
           promptMessages,
         },
         "llm prompt trace",
@@ -146,8 +154,21 @@ export async function respond(options: RespondOptions): Promise<void> {
         enableThinking: config.llmEnableThinking,
         thinkingMaxTokens: config.llmThinkingMaxTokens,
         thinkingTimeoutMs: config.llmThinkingTimeoutMs,
+        tools,
       });
       const { response } = generated;
+
+      if (response.toolCalls?.length) {
+        await executeToolCalls({
+          response,
+          message,
+          actionContext,
+          actionRegistry,
+          log,
+        });
+        return;
+      }
+
       const content = await repairMissingSplitHints({
         llm,
         content: generated.content,
@@ -255,6 +276,61 @@ async function repairMissingSplitHints(options: {
   return repaired;
 }
 
+async function executeToolCalls(options: {
+  response: LlmResponse;
+  message: Message;
+  actionContext?: ActionContext | undefined;
+  actionRegistry?: ActionRegistry | undefined;
+  log: Logger;
+}): Promise<void> {
+  if (!options.actionContext || !options.actionRegistry) {
+    throw new Error(
+      "LLM returned tool calls but action execution is unavailable",
+    );
+  }
+
+  for (const toolCall of options.response.toolCalls ?? []) {
+    const resolved = options.actionRegistry.getToolCallTrigger(toolCall.name);
+    if (!resolved) throw new Error(`Unknown tool call: ${toolCall.name}`);
+
+    const args = parseToolArguments(toolCall.arguments);
+    options.log.debug(
+      {
+        toolCallId: toolCall.id,
+        toolName: toolCall.name,
+        action: resolved.action.name,
+      },
+      "executing LLM tool call action",
+    );
+    await resolved.action.execute(
+      {
+        source: "tool_call",
+        channelId: options.message.channelId,
+        guildId: options.message.guildId ?? undefined,
+        requester: {
+          id: options.message.author.id,
+          name:
+            options.message.author.globalName ??
+            options.message.author.username,
+        },
+        triggerMessage: options.message,
+        args,
+      },
+      options.actionContext,
+    );
+  }
+}
+
+function parseToolArguments(argumentsJson: string): unknown {
+  try {
+    return JSON.parse(argumentsJson || "{}");
+  } catch (error) {
+    throw new Error(`Invalid tool call arguments JSON: ${argumentsJson}`, {
+      cause: error,
+    });
+  }
+}
+
 function withClassifierDecisionBlock(
   transcript: string,
   decision: ClassifierDecision | undefined,
@@ -277,6 +353,7 @@ async function generateResponse(options: {
   enableThinking: boolean;
   thinkingMaxTokens: number;
   thinkingTimeoutMs: number;
+  tools: LlmTool[];
 }): Promise<{ content: string; response: LlmResponse }> {
   return completeAndSanitize(options.llm, {
     messages: options.promptMessages,
@@ -284,6 +361,7 @@ async function generateResponse(options: {
     enableThinking: options.enableThinking,
     thinkingMaxTokens: options.thinkingMaxTokens,
     thinkingTimeoutMs: options.thinkingTimeoutMs,
+    tools: options.tools,
   });
 }
 
@@ -295,6 +373,7 @@ async function completeAndSanitize(
     enableThinking?: boolean;
     thinkingMaxTokens: number;
     thinkingTimeoutMs: number;
+    tools: LlmTool[];
   },
 ): Promise<{ content: string; response: LlmResponse }> {
   if (!request.enableThinking) {
@@ -311,7 +390,9 @@ async function completeAndSanitize(
       ...request,
       maxTokens: request.thinkingMaxTokens,
       signal: thinkingSignal.signal,
+      ...(request.tools.length > 0 ? { toolChoice: "auto" as const } : {}),
     });
+    if (response.toolCalls?.length) return { content: "", response };
     const content = stripUnicodeEmoji(response.content.trim());
     if (content) return { content, response };
 
@@ -322,7 +403,12 @@ async function completeAndSanitize(
     if (request.signal.aborted) throw error;
     const reason = isAbortError(error) ? "timeout" : "empty_or_failed";
     // Fall back to a no-thinking request so Discord typing does not hang on long reasoning.
-    const retry = await llm.complete({ ...request, enableThinking: false });
+    const retry = await llm.complete({
+      ...request,
+      enableThinking: false,
+      ...(request.tools.length > 0 ? { toolChoice: "auto" as const } : {}),
+    });
+    if (retry.toolCalls?.length) return { content: "", response: retry };
     const retryContent = stripUnicodeEmoji(retry.content.trim());
     if (retryContent) return { content: retryContent, response: retry };
 
@@ -340,9 +426,14 @@ async function completeAndRequireContent(
     messages: LlmMessage[];
     signal: AbortSignal;
     enableThinking?: boolean;
+    tools: LlmTool[];
   },
 ): Promise<{ content: string; response: LlmResponse }> {
-  const response = await llm.complete(request);
+  const response = await llm.complete({
+    ...request,
+    ...(request.tools.length > 0 ? { toolChoice: "auto" as const } : {}),
+  });
+  if (response.toolCalls?.length) return { content: "", response };
   const content = stripUnicodeEmoji(response.content.trim());
   if (content) return { content, response };
 
