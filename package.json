@@ -8,6 +8,8 @@
     "build": "tsup src/index.ts --format esm --target node22 --clean",
     "start": "node dist/index.js",
     "check": "biome check . && tsc --noEmit",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
     "fix": "biome check --write .",
     "test": "vitest run",
     "test:watch": "vitest"
@@ -15,12 +17,14 @@
   "dependencies": {
     "discord.js": "^14.18.0",
     "dotenv": "^16.4.7",
+    "drizzle-orm": "^0.45.2",
     "effect": "beta",
     "pino": "^9.6.0"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
     "@types/node": "^22.13.10",
+    "drizzle-kit": "^0.31.10",
     "tsup": "^8.4.0",
     "tsx": "^4.19.3",
     "typescript": "^5.8.2",
