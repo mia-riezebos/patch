@@ -35,6 +35,9 @@ pnpm-debug.log*
 .vscode/
 .obsidian/
 
+# generated prompt assembly snapshots
+/fixtures/assembled-prompts/
+
 # local scratch / agent worktrees
 Scratchpad*.md
 .worktrees/
